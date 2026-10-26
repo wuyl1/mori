@@ -132,6 +132,8 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   pc_config.ranged_get_scratch_size = ranged_get_scratch_size_;
   pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
   pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
+  pc_config.ranged_scratch_use_hugepages = dc.ranged_scratch_use_hugepages;
+  pc_config.ranged_scratch_hugepage_size = dc.ranged_scratch_hugepage_size;
   pc_config.copy_pipeline = config_.copy_pipeline;
 
   auto release_scratch = [this] {

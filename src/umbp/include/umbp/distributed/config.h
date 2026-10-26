@@ -272,6 +272,10 @@ struct PoolClientConfig {
   size_t ranged_get_scratch_size = 0;
   void* ranged_put_scratch_buffer = nullptr;
   size_t ranged_put_scratch_size = 0;
+  // Page backing for the per-GPU ranged arenas PoolClient allocates itself, taken
+  // from the caller's: the same page size as the shared pair above.
+  bool ranged_scratch_use_hugepages = false;
+  size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;
 
   // SSD staging pages per SsdBackend; 0 = the preset (SsdStagingPages).  Its
   // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.

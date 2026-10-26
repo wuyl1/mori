@@ -1179,6 +1179,7 @@ bool PoolClient::Init() {
                    scratch_shards, ranged_get_scratch_.ShardBytes(),
                    ranged_put_scratch_.ShardBytes());
   }
+  InitGpuScratch(scratch_shards);
   // The switches that decide how much of a ranged call is even reachable, said
   // once at startup so a run can assert which configuration it got.  An arm
   // that silently ran a different one is the failure mode that still produces
@@ -1401,6 +1402,9 @@ void PoolClient::Shutdown() {
   peer_directory_ = nullptr;
   hbm_engine_ = nullptr;
   transfer_engine_.reset();
+  HostMemAllocator allocator;
+  for (auto& scratch : gpu_scratch_) allocator.Free(scratch.handle);
+  gpu_scratch_.clear();
 
   // Drop the sink before the object it may point at. In the master-backed
   // deployment metric_sink_ aliases master_client_, so leaving it set here
@@ -3345,6 +3349,79 @@ std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const voi
 
 }  // namespace
 
+void PoolClient::InitGpuScratch(size_t shards) {
+  // On by default; UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU=0 keeps every GPU on the
+  // caller-provided shared arena.
+  const char* on = std::getenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU");
+  if ((on != nullptr && std::string(on) == "0") || config_.ranged_get_scratch_size == 0) return;
+  if (gpu_to_numa_.empty()) {
+    int count = 0;
+    if (hipGetDeviceCount(&count) == hipSuccess) {
+      for (int device = 0; device < count; ++device) {
+        int node = -1;
+        mori::application::detail::GpuLocalCpuList(device, node);
+        if (node >= 0) gpu_to_numa_.emplace(device, node);
+      }
+    }
+  }
+  HostMemAllocator allocator;
+  const std::map<int, int> by_device(gpu_to_numa_.begin(), gpu_to_numa_.end());
+  for (const auto& [device, node] : by_device) {
+    HostBufferOptions opts;
+    if (config_.ranged_scratch_use_hugepages) {
+      opts.backing = HostBufferBacking::kAnonymousHugetlb;
+      opts.hugepage_size = config_.ranged_scratch_hugepage_size;
+    }
+    opts.numa_node = node;
+    opts.numa_bind_mode = NumaBindMode::kBind;
+    opts.require_numa_binding = true;
+    GpuScratch scratch;
+    scratch.device = device;
+    scratch.numa_node = node;
+    scratch.handle = allocator.Alloc(config_.ranged_get_scratch_size, opts);
+    if (!scratch.handle.valid() ||
+        !RegisterMemory(scratch.handle.ptr, scratch.handle.mapped_size)) {
+      allocator.Free(scratch.handle);
+      MORI_UMBP_WARN(
+          "[PoolClient] ranged GET scratch for GPU {} (NUMA node {}) unavailable; it uses the "
+          "shared arena",
+          device, node);
+      continue;
+    }
+    if (hbm_engine_ != nullptr) {
+      hbm_engine_->AddHostGatherRegion(scratch.handle.ptr, scratch.handle.mapped_size);
+    }
+    scratch.arena = std::make_unique<ScratchArena>();
+    scratch.arena->Reset(scratch.handle.ptr, scratch.handle.mapped_size, shards);
+    gpu_scratch_.push_back(std::move(scratch));
+  }
+  if (!gpu_scratch_.empty()) {
+    const auto& first = gpu_scratch_.front();
+    MORI_UMBP_INFO(
+        "[PoolClient] ranged GET scratch per GPU: {} of {} GPUs, each on its NUMA node, "
+        "shards={} shard={}B ({})",
+        gpu_scratch_.size(), by_device.size(), shards, first.arena->ShardBytes(),
+        first.handle.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb"
+                                                                            : "anonymous");
+  }
+}
+
+PoolClient::ArenaRef PoolClient::RangedGetArenaFor(const void* ptr) {
+  if (!gpu_scratch_.empty() && ptr != nullptr) {
+    const auto ref = UserBufferRef(const_cast<void*>(ptr), 1).first;
+    if (ref.loc == mori::io::MemoryLocationType::GPU) {
+      for (auto& scratch : gpu_scratch_) {
+        if (scratch.device == ref.device) {
+          return {scratch.arena.get(), static_cast<char*>(scratch.handle.ptr),
+                  scratch.handle.mapped_size};
+        }
+      }
+    }
+  }
+  return {&ranged_get_scratch_, static_cast<char*>(config_.ranged_get_scratch_buffer),
+          config_.ranged_get_scratch_size};
+}
+
 void PoolClient::ScratchArena::Reset(void* base, size_t bytes, size_t shards) {
   std::lock_guard<std::mutex> lock(mutex_);
   bases_.clear();
@@ -3728,9 +3805,17 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // GET has its own arena, so it overlaps a concurrent remote PUT (which uses
   // the separate PUT arena).  Sizing below is against ONE SHARD, not the whole
   // buffer: a unit that fits the buffer but not a shard would never get a slice.
-  char* const scratch_all = static_cast<char*>(config_.ranged_get_scratch_buffer);
-  if (scratch_all == nullptr || ranged_get_scratch_.ShardBytes() == 0 ||
-      !FindRegisteredMemory(scratch_all, config_.ranged_get_scratch_size).has_value()) {
+  const void* caller_buffer = nullptr;
+  for (size_t index : missed) {
+    if (!dsts[index].empty()) {
+      caller_buffer = dsts[index].front();
+      break;
+    }
+  }
+  const ArenaRef arena = RangedGetArenaFor(caller_buffer);
+  char* const scratch_all = arena.base;
+  if (scratch_all == nullptr || arena.arena->ShardBytes() == 0 ||
+      !FindRegisteredMemory(scratch_all, arena.size).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: ranged scratch is absent or not registered");
     return results;
   }
@@ -3746,8 +3831,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // even the full arena is no better off exclusive, so it must not answer for
   // the others: taking the max let one such key veto exclusivity for a
   // batch-mate that needed it and would have fitted.
-  const size_t shard_bytes = ranged_get_scratch_.ShardBytes();
-  const size_t full_bytes = config_.ranged_get_scratch_size;
+  const size_t shard_bytes = arena.arena->ShardBytes();
+  const size_t full_bytes = arena.size;
   bool exclusive_arena = false;
   for (size_t index : missed) {
     size_t key_total = 0;
@@ -3887,8 +3972,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease =
-        exclusive_arena ? ranged_get_scratch_.AcquireAll() : ranged_get_scratch_.Acquire();
+    scratch_lease = exclusive_arena ? arena.arena->AcquireAll() : arena.arena->Acquire();
   }
   char* const scratch_base = scratch_lease.base();
   // The arena described ONCE, by its registered base.  Plans key on (src base,

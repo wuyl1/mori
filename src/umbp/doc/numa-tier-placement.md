@@ -87,6 +87,16 @@ This policy favors locality over the opportunity to put an entire object in a
 remote contiguous run. Its net benefit depends on fragmentation and workload.
 It does not migrate existing objects or replicate shared keys across sockets.
 
+## Ranged I/O
+
+Ranged GET stages remote bytes through a host arena. Besides the shared one,
+every GPU gets its own, bound to its node, and a remote get uses its caller
+buffer's GPU's arena (`UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU`). With only the
+shared arena, every rank's remote reads waited on one arena, used the NICs of
+whichever node its pages landed on, and half the GPUs copied across sockets.
+Ranged PUT keeps the shared PUT arena: remote writes are bound by their slot
+round trips, and letting every GPU write at once made them slower.
+
 ## Measured effect
 
 One MI355X node (two sockets, eight GPUs), DeepSeek-V4-Pro at TP8, SGLang with
