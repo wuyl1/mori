@@ -1201,16 +1201,19 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
             }
 
             // Join the producers before the leader's release publishes their stores.
+            // Agent scope is enough: the completing warp re-releases at system scope.
             ::mori::cco::ccoCoopWarp{}.sync();
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
             index_t finished = 0;
             if (laneId == 0)
               finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
             finished = __shfl(finished, 0);
             if ((finished + 1) >= (numRecvBlock * warpNum)) {
               if (laneId == 0) {
-                // Acquire all producers through the completion-counter RMW chain.
+                // Acquire all producers through the completion-counter RMW chain, then
+                // release once at system scope before the NIC reads the staging rows.
                 __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
                 core::AtomicStoreSeqCstSystem(
                     args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum +
                         k,
@@ -1363,16 +1366,19 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       }
 
       // Join the producers before the leader's release publishes their stores.
+      // Agent scope is enough: the completing warp re-releases at system scope.
       ::mori::cco::ccoCoopWarp{}.sync();
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
       index_t finished = 0;
       if (laneId == 0)
         finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
       finished = __shfl(finished, 0);
       if ((finished + 1) >= (warpsPerToken * warpSize)) {
         if (laneId == 0) {
-          // Acquire all producers through the completion-counter RMW chain.
+          // Acquire all producers through the completion-counter RMW chain, then
+          // release once at system scope before the NIC reads the staging rows.
           __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+          __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
           core::AtomicStoreSeqCstSystem(
               args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum + k,
               uint64_t{0});
