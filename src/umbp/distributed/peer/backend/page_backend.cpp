@@ -409,6 +409,18 @@ AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size
     const auto it =
         std::find(buffer_numa_nodes_.begin(), buffer_numa_nodes_.end(), preferred_numa_node);
     if (it != buffer_numa_nodes_.end()) preferred_buffer = it - buffer_numa_nodes_.begin();
+  } else if (buffer_numa_nodes_.size() > 1) {
+    // No hint (a CPU caller, or a remote writer that sent none): fill the nodes'
+    // buffers evenly instead of the first one first, so readers' NICs on every
+    // node share the traffic.
+    uint32_t most_free = 0;
+    for (size_t i = 0; i < allocator_->NumBuffers(); ++i) {
+      const uint32_t free_pages = allocator_->BufferFreePages(i);
+      if (free_pages > most_free) {
+        most_free = free_pages;
+        preferred_buffer = i;
+      }
+    }
   }
   auto pages = allocator_->Allocate(num_pages, preferred_buffer);
   if (!pages) return fail(AllocateOutcome::kFailedNoSpace, "NO_SPACE");

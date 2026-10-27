@@ -92,6 +92,9 @@ class PagePool {
   // free-list or slab implementation awkward to write.
   virtual size_t NumBuffers() const = 0;
   virtual uint32_t BufferPageCount(size_t buffer_index) const = 0;
+  // Free pages in one buffer; 0 for an implementation that does not track them,
+  // which leaves placement to its own order.
+  virtual uint32_t BufferFreePages(size_t /*buffer_index*/) const { return 0; }
 
  protected:
   PagePool() = default;
