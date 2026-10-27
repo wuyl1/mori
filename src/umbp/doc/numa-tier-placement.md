@@ -87,6 +87,20 @@ This policy favors locality over the opportunity to put an entire object in a
 remote contiguous run. Its net benefit depends on fragmentation and workload.
 It does not migrate existing objects or replicate shared keys across sockets.
 
+## Remote writes
+
+A write routed to another node carries the same advisory hint in its slot
+request: the node of the writer's GPU, also when a ranged put stages the bytes
+through the ranged PUT arena, otherwise the node of a registered host source.
+The peer prefers its buffer on that node. Without a hint (a CPU caller, or a
+writer that sends none), a tier with one buffer per node allocates from the
+buffer with the most free pages instead of the first one first, so both nodes
+fill evenly. A peer whose tier has one buffer keeps the original order.
+
+Each side of an RDMA transfer picks its NICs from the node of its own memory, so
+the object then travels between NICs on the same node at both ends when the
+reader is the GPU that wrote it.
+
 ## Measured effect
 
 One MI355X node (two sockets, eight GPUs), DeepSeek-V4-Pro at TP8, SGLang with
