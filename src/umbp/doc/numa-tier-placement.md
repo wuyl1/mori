@@ -91,7 +91,7 @@ It does not migrate existing objects or replicate shared keys across sockets.
 
 A write routed to another node carries the same advisory hint in its slot
 request: the node of the writer's GPU, also when a ranged put stages the bytes
-through the shared PUT arena (otherwise the node of a registered host source).
+through a host arena (otherwise the node of a registered host source).
 The peer prefers its buffer on that node. Without a hint (a CPU caller, or a
 writer that sends none), a tier with one buffer per node allocates from the
 buffer with the most free pages instead of the first one first, so both nodes
@@ -101,13 +101,21 @@ Each side of an RDMA transfer picks its NICs from the node of its own memory, so
 the object then travels between NICs on the same node at both ends when the
 reader is the GPU that wrote it.
 
-Ranged GET stages remote bytes through a host arena. Besides the shared one,
-every GPU gets its own, bound to its node, and a remote get uses its caller
-buffer's GPU's arena (`UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU`). With only the
-shared arena, every rank's remote reads waited on one arena, used the NICs of
+Ranged I/O stages remote bytes through host arenas, one for GET and one for
+PUT. Besides the shared pair, every GPU gets a pair of its own, bound to its
+node, and a remote get or put uses its buffer's GPU's arena
+(`UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU`). With only the shared pair, every
+rank's remote transfers waited on one arena per direction, used the NICs of
 whichever node its pages landed on, and half the GPUs copied across sockets.
-Ranged PUT keeps the shared PUT arena: remote writes are bound by their slot
-round trips, and letting every GPU write at once made them slower.
+
+Measured between two MI355X nodes (eight 400G NICs each, one rank per GPU,
+14 MiB objects in 2 MiB ranges, eight per call): remote ranged reads at eight
+ranks went from 67 to 167–182 GB/s and writes from 30 to 50–58 GB/s, with every
+NIC on both nodes carrying an even share. One shared 2 GiB arena cut into eight
+256 MiB shards reads at 142 GB/s, so most of the gain is that no GPU waits on
+another and the rest is the NUMA-local NICs. Writes stay bound by their route
+and slot round trips. Hugetlb arenas (`UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES`)
+add another 5–10% to the reads.
 
 ## Measured effect
 

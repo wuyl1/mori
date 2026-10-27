@@ -776,16 +776,19 @@ class PoolClient {
   ScratchArena ranged_get_scratch_;
   ScratchArena ranged_put_scratch_;
 
-  // A ranged GET arena for every GPU, bound to its NUMA node, besides the shared one above
-  // (UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU=0 turns them off).  A remote ranged get takes
-  // its caller buffer's GPU's arena: no GPU waits on another's, the RDMA leg uses NICs on
-  // the GPU's node (picked from the arena's node when it is registered), and the copy into
-  // the GPU stays on its socket.  Ranged PUT keeps the shared arena.
+  // A ranged GET and a ranged PUT arena for every GPU, bound to its NUMA node, besides the
+  // shared pair above (UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU=0 turns them off).  A remote
+  // ranged get takes its caller buffer's GPU's GET arena and a remote ranged put its first
+  // source buffer's GPU's PUT arena: no GPU waits on another's, the RDMA leg uses NICs on
+  // the GPU's node (picked from the arena's node when it is registered), and the copy
+  // between the arena and the GPU stays on its socket.
   struct GpuScratch {
     int device = -1;
     int numa_node = -1;
     HostBufferHandle handle;
     std::unique_ptr<ScratchArena> arena;
+    HostBufferHandle put_handle;
+    std::unique_ptr<ScratchArena> put_arena;
   };
   std::vector<GpuScratch> gpu_scratch_;
   struct ArenaRef {
@@ -795,6 +798,8 @@ class PoolClient {
   };
   // The arena a remote ranged GET whose caller buffer is `ptr` uses.
   ArenaRef RangedGetArenaFor(const void* ptr);
+  // The arena a remote ranged PUT whose first source buffer is `ptr` uses.
+  ArenaRef RangedPutArenaFor(const void* ptr);
   void InitGpuScratch(size_t shards);
   std::condition_variable recache_cv_;
   std::thread recache_worker_;

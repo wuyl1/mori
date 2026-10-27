@@ -812,6 +812,55 @@ TEST_F(PoolClientRangesTest, SplitRemotePutThenGetRoundTrips) {
   }
 }
 
+// The same round trip from and into GPU memory, which stages through that GPU's own
+// PUT and GET arenas (UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU).  The last GPU, so on a
+// two-socket host the arenas are the second node's.
+TEST_F(PoolClientRangesTest, GpuRemotePutThenGetRoundTripsThroughPerGpuArenas) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices < 1) GTEST_SKIP() << "no GPU";
+  int previous = 0;
+  ASSERT_EQ(hipGetDevice(&previous), hipSuccess);
+  ASSERT_EQ(hipSetDevice(devices - 1), hipSuccess);
+  void* src = nullptr;
+  void* dst = nullptr;
+  const hipError_t src_rc = hipMalloc(&src, kObjectSize);
+  const hipError_t dst_rc = hipMalloc(&dst, kObjectSize);
+  ASSERT_EQ(hipSetDevice(previous), hipSuccess);
+  struct Release {
+    void* ptrs[2];
+    ~Release() {
+      for (void* p : ptrs) {
+        if (p != nullptr) (void)hipFree(p);
+      }
+    }
+  } release{{src, dst}};
+  ASSERT_EQ(src_rc, hipSuccess);
+  ASSERT_EQ(dst_rc, hipSuccess);
+
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 13 + 5) & 0xff);
+  ASSERT_EQ(hipMemcpy(src, object.data(), kObjectSize, hipMemcpyHostToDevice), hipSuccess);
+  ASSERT_EQ(hipMemset(dst, 0, kObjectSize), hipSuccess);
+
+  const std::string key = "gpu-remote-split";
+  const auto* src_bytes = static_cast<const char*>(src);
+  auto put = caller_->BatchPutRanges({key}, {kObjectSize}, {{src_bytes, src_bytes + 2048}},
+                                     {{2048, kObjectSize - 2048}}, {{0, 2048}});
+  ASSERT_EQ(put, std::vector<bool>({true}));
+  caller_->Master().FlushHeartbeat();
+  target_->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(caller_.get(), key));
+  ASSERT_FALSE(LocallyResident(caller_.get(), key));
+
+  auto* dst_bytes = static_cast<char*>(dst);
+  auto got = caller_->BatchGetRanges({key}, {{dst_bytes, dst_bytes + 1000}},
+                                     {{1000, kObjectSize - 1000}}, {{0, 1000}});
+  ASSERT_EQ(got, std::vector<bool>({true}));
+  std::vector<char> actual(kObjectSize);
+  ASSERT_EQ(hipMemcpy(actual.data(), dst, kObjectSize, hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), object.data(), kObjectSize), 0);
+}
+
 // One object too big for the WHOLE arena must not decide arena sizing for its
 // batch-mates.  Sharding sizes a call against one shard and falls back to the
 // whole arena exclusively for anything that needs more; asking that question as

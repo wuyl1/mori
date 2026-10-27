@@ -1403,7 +1403,10 @@ void PoolClient::Shutdown() {
   hbm_engine_ = nullptr;
   transfer_engine_.reset();
   HostMemAllocator allocator;
-  for (auto& scratch : gpu_scratch_) allocator.Free(scratch.handle);
+  for (auto& scratch : gpu_scratch_) {
+    allocator.Free(scratch.handle);
+    allocator.Free(scratch.put_handle);
+  }
   gpu_scratch_.clear();
 
   // Drop the sink before the object it may point at. In the master-backed
@@ -3366,7 +3369,7 @@ std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const voi
 
 void PoolClient::InitGpuScratch(size_t shards) {
   // On by default; UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU=0 keeps every GPU on the
-  // caller-provided shared arena.
+  // caller-provided shared arenas.
   const char* on = std::getenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_PER_GPU");
   if ((on != nullptr && std::string(on) == "0") || config_.ranged_get_scratch_size == 0) return;
   if (gpu_to_numa_.empty()) {
@@ -3408,17 +3411,51 @@ void PoolClient::InitGpuScratch(size_t shards) {
     }
     scratch.arena = std::make_unique<ScratchArena>();
     scratch.arena->Reset(scratch.handle.ptr, scratch.handle.mapped_size, shards);
+    if (config_.ranged_put_scratch_size > 0) {
+      scratch.put_handle = allocator.Alloc(config_.ranged_put_scratch_size, opts);
+      if (scratch.put_handle.valid() &&
+          RegisterMemory(scratch.put_handle.ptr, scratch.put_handle.mapped_size)) {
+        if (hbm_engine_ != nullptr) {
+          hbm_engine_->AddHostGatherRegion(scratch.put_handle.ptr, scratch.put_handle.mapped_size);
+        }
+        scratch.put_arena = std::make_unique<ScratchArena>();
+        scratch.put_arena->Reset(scratch.put_handle.ptr, scratch.put_handle.mapped_size, shards);
+      } else {
+        allocator.Free(scratch.put_handle);
+        MORI_UMBP_WARN(
+            "[PoolClient] ranged PUT scratch for GPU {} (NUMA node {}) unavailable; it uses the "
+            "shared arena",
+            device, node);
+      }
+    }
     gpu_scratch_.push_back(std::move(scratch));
   }
   if (!gpu_scratch_.empty()) {
     const auto& first = gpu_scratch_.front();
     MORI_UMBP_INFO(
-        "[PoolClient] ranged GET scratch per GPU: {} of {} GPUs, each on its NUMA node, "
+        "[PoolClient] ranged scratch per GPU: {} of {} GPUs ({}), each on its NUMA node, "
         "shards={} shard={}B ({})",
-        gpu_scratch_.size(), by_device.size(), shards, first.arena->ShardBytes(),
+        gpu_scratch_.size(), by_device.size(), first.put_arena != nullptr ? "GET and PUT" : "GET",
+        shards, first.arena->ShardBytes(),
         first.handle.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb"
                                                                             : "anonymous");
   }
+}
+
+PoolClient::ArenaRef PoolClient::RangedPutArenaFor(const void* ptr) {
+  if (!gpu_scratch_.empty() && ptr != nullptr) {
+    const auto ref = UserBufferRef(const_cast<void*>(ptr), 1).first;
+    if (ref.loc == mori::io::MemoryLocationType::GPU) {
+      for (auto& scratch : gpu_scratch_) {
+        if (scratch.device == ref.device && scratch.put_arena != nullptr) {
+          return {scratch.put_arena.get(), static_cast<char*>(scratch.put_handle.ptr),
+                  scratch.put_handle.mapped_size};
+        }
+      }
+    }
+  }
+  return {&ranged_put_scratch_, static_cast<char*>(config_.ranged_put_scratch_buffer),
+          config_.ranged_put_scratch_size};
 }
 
 PoolClient::ArenaRef PoolClient::RangedGetArenaFor(const void* ptr) {
@@ -4269,9 +4306,17 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   // so this is the one direction that needs the arena.  PUT has its own arena,
   // so it overlaps a concurrent remote GET (which uses the separate GET arena).
   // Sizing is against ONE SHARD; see the GET path for why.
-  char* const scratch_all = static_cast<char*>(config_.ranged_put_scratch_buffer);
-  if (scratch_all == nullptr || ranged_put_scratch_.ShardBytes() == 0 ||
-      !FindRegisteredMemory(scratch_all, config_.ranged_put_scratch_size).has_value()) {
+  const void* caller_buffer = nullptr;
+  for (size_t r : remote) {
+    if (!srcs[valid[r]].empty()) {
+      caller_buffer = srcs[valid[r]].front();
+      break;
+    }
+  }
+  const ArenaRef arena = RangedPutArenaFor(caller_buffer);
+  char* const scratch_all = arena.base;
+  if (scratch_all == nullptr || arena.arena->ShardBytes() == 0 ||
+      !FindRegisteredMemory(scratch_all, arena.size).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
     return results;
   }
@@ -4280,8 +4325,8 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   // the get path spells out: a batch-wide max lets an object too big for the
   // whole arena veto exclusivity for one that needed it, and that one then gets
   // rejected at shard size though it was servable before sharding existed.
-  const size_t put_shard_bytes = ranged_put_scratch_.ShardBytes();
-  const size_t put_full_bytes = config_.ranged_put_scratch_size;
+  const size_t put_shard_bytes = arena.arena->ShardBytes();
+  const size_t put_full_bytes = arena.size;
   bool exclusive_arena = false;
   for (size_t r : remote) {
     const size_t object_size = object_sizes[valid[r]];
@@ -4294,8 +4339,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease =
-        exclusive_arena ? ranged_put_scratch_.AcquireAll() : ranged_put_scratch_.Acquire();
+    scratch_lease = exclusive_arena ? arena.arena->AcquireAll() : arena.arena->Acquire();
   }
   char* const scratch_base = scratch_lease.base();
   // The arena named once, by its registered base -- the read side's reason
@@ -4333,8 +4377,8 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     std::vector<size_t> sub_sizes;
     std::vector<std::optional<RoutePutResult>> sub_routes;
     std::vector<size_t> sub_originals;
-    // The writer's GPU node per object: its bytes leave from the shared arena, whose
-    // node says nothing about where the reader of the object will be.
+    // The writer's GPU node per object: its bytes leave from an arena, and when that
+    // is the shared one its node says nothing about where the object's reader will be.
     std::vector<int> sub_numa;
     sub_keys.reserve(count);
     sub_srcs.reserve(count);
