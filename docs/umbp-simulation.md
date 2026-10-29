@@ -56,6 +56,7 @@ path rejects the transfer. Unused paths may be omitted.
 This first version uses manually supplied parameters. Automatic calibration belongs in
 a follow-up PR covering the actual engines (`LocalCopyEngine`, `HbmCopyEngine` and
 `MoriIoEngine`), with reusable profiles for CPU, GPU and RDMA transfers.
+The [calibration draft](umbp-calibration.md) currently covers CPU copies only.
 
 | Field | Meaning |
 | --- | --- |
